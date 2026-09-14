@@ -183,6 +183,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+          EXPECTED_BASE_SHA: ${{ needs.resolve.outputs.base_sha }}
+          EXPECTED_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -192,6 +194,8 @@ jobs:
           pr_json="$(curl -fsSL --retry 2 "${auth[@]}" "$pull_url")"
           base_sha="$(printf '%s' "$pr_json" | python -c 'import json, sys; print(json.load(sys.stdin)["base"]["sha"])')"
           head_sha="$(printf '%s' "$pr_json" | python -c 'import json, sys; print(json.load(sys.stdin)["head"]["sha"])')"
+          test "$base_sha" = "$EXPECTED_BASE_SHA"
+          test "$head_sha" = "$EXPECTED_HEAD_SHA"
           curl -fsSL --retry 2 \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.diff" \
