@@ -48,6 +48,10 @@ merge jobは手動実行で `merge=true` かつjudgeの `approve` の場合だ�
 
 Actionsを手動実行する場合は、対象PR番号を入力し、judge結果を確認したうえで `merge=true` を指定します。自動mergeの判断器をPR headから実行しないことがこのworkflowの信頼境界です。
 
+judgeは `<!-- flymerge:report:v1 -->` marker付きの単一issue commentを `GET` → bot commentの `PATCH`、なければ `POST` でupsertします。コメントは🪰 verdict、神託、neuron/edge/tick、approach/aversive/motor、edge ablation、Actions runの詳細を表示し、PR本文やPR差分の自由文は埋め込みません。PRごとのActions concurrencyも設定して、synchronizeでコメントが増殖しにくいようにしています。
+
+approve verdictでは公式のGitHub review `APPROVE` も試みます。Actions settingsでreviewの自動submitが無効なら、reviewを捏造せず、commentとjudge checkだけを正確なFlyMerge verdictとして残します。仕様の根拠はGitHub公式のREST APIとActions security documentationです。
+
 ## 判定とモデル
 
 差分のパスと追加・削除行から、テスト、文書、認証/秘密情報、workflow、runtime、UI、dataなどの語を上限付きで数え、実在する感覚群へ刺激します。既存FlyBrain browser実装の形式と設定に合わせて、leak `0.95`、threshold `1.0`、refractory `3`、最大絶対weightで正規化した基準scale `0.15`、20 tickを使い、下流readout用のdimensionless `synaptic_gain=16` を掛けます。これは固定実dataでedgeあり/なしのreadout差が出る運用校正値で、生物学的な測定値ではありません。

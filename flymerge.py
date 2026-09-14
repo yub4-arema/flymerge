@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import html
 import json
 import math
 import os
@@ -70,6 +71,7 @@ MOTOR_OUTPUTS = {"VNC_CPG", "MN_PROBOSCIS", "MN_HEAD", "MN_ABDOMEN", "GENERIC_MO
 SYNAPTIC_GAIN = 16.0
 DEFAULT_TICKS = 20
 GITHUB_API = "https://api.github.com"
+COMMENT_MARKER = "<!-- flymerge:report:v1 -->"
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -369,24 +371,64 @@ def evaluate(
     return result
 
 
-def markdown(result: dict) -> str:
+def _safe(value: object) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def markdown(result: dict, *, marker: bool = False, pr_number: int | None = None, run_url: str | None = None) -> str:
     decision = result["decision"]
     simulation = result["simulation"]
-    return "\n".join(
-        [
-            f"# FlyMerge: `{decision['verdict']}`",
-            "",
-            f"- Confidence: `{decision['confidence']}`",
-            f"- Reason: {decision['reason']}",
-            f"- Diff: `{result['input']['diff_sha256'][:12]}` ({len(result['input']['files'])} files, +{result['input']['added_lines']}/-{result['input']['removed_lines']})",
-            f"- Connectome: `{result['connectome']['neuron_count']:,}` neurons / `{result['connectome']['edge_count']:,}` edges",
-            f"- Simulation: `{simulation['ticks']}` ticks, `{simulation['fired_neurons_total']:,}` fired neurons",
-            f"- Downstream readout: `{simulation['readout_fired_neurons_total']:,}` fired in {len(simulation['readout_groups'])} groups; approach `{simulation['appetitive_channel_spikes']}`, aversive `{simulation['aversive_channel_spikes']}`, motor `{simulation['motor_output_spikes']}`",
-            *([f"- Edge ablation: without edges readout `{result['edge_ablation']['without_edges']['readout_fired_neurons_total']:,}` / decision `{result['edge_ablation']['without_edges_decision']['verdict']}`; real-edge contribution `{result['edge_ablation']['edge_contribution']['synaptic_events']:+,}` events; decision changed `{result['edge_ablation']['decision_changed']}`"] if "edge_ablation" in result else []),
-            "",
-            "This is a joke heuristic, not a software-quality or scientific decision procedure.",
-        ]
-    ) + "\n"
+    verdict = str(decision["verdict"])
+    badge = {"approve": "✅", "reject": "🚨", "hold": "🫥"}.get(verdict, "🪰")
+    oracle = {
+        "approve": "追い風。回路は前進を選んだ。",
+        "reject": "警報。回路は危険側へ傾いた。",
+        "hold": "沈黙。回路はまだ決められない。",
+    }.get(verdict, "神託は不明。")
+    lines = [
+        *([COMMENT_MARKER, ""] if marker else []),
+        f"## 🪰 FlyMerge verdict: `{_safe(verdict.upper())}` {badge}",
+        "",
+        f"> 🔮 神託: {_safe(oracle)}",
+        "",
+        f"**Confidence** `{_safe(decision['confidence'])}` · **Diff** `{_safe(result['input']['diff_sha256'][:12])}` · **Files** `{len(result['input']['files'])}` (+{result['input']['added_lines']}/-{result['input']['removed_lines']})",
+        "",
+        "| 🧠 Connectome | ⏱ Simulation |",
+        "|---|---|",
+        f"| `{result['connectome']['neuron_count']:,}` neurons · `{result['connectome']['edge_count']:,}` edges | `{simulation['ticks']}` ticks · gain `{simulation['synaptic_gain']}` |",
+        "",
+        "### Signal channels",
+        "| Approach | Aversive | Motor |",
+        "|---:|---:|---:|",
+        f"| `{simulation['appetitive_channel_spikes']}` | `{simulation['aversive_channel_spikes']}` | `{simulation['motor_output_spikes']}` |",
+    ]
+    if "edge_ablation" in result:
+        ablation = result["edge_ablation"]
+        lines.extend(
+            [
+                "",
+                "### 🕸️ Edge ablation",
+                f"Real edges: `{simulation['readout_fired_neurons_total']:,}` readout spikes · `{simulation['synaptic_events']:,}` synaptic events · verdict `{_safe(verdict)}`",
+                f"Without edges: `{ablation['without_edges']['readout_fired_neurons_total']:,}` readout spikes · verdict `{_safe(ablation['without_edges_decision']['verdict'])}` · decision changed `{ablation['decision_changed']}`",
+            ]
+        )
+    details = [
+        "",
+        "<details>",
+        "<summary>🧬 Neural details</summary>",
+        "",
+        f"- Fired neurons: `{simulation['fired_neurons_total']:,}`; downstream readout: `{simulation['readout_fired_neurons_total']:,}` in `{len(simulation['readout_groups'])}` groups.",
+        f"- Reason: {_safe(decision['reason'])}",
+    ]
+    details.extend(["", "</details>"])
+    lines.extend(details)
+    if run_url and re.fullmatch(r"https://[^/\s]+/[^/\s]+/[^/\s]+/actions/runs/\d+", run_url):
+        lines.extend(["", f"[View the FlyMerge Actions run]({_safe(run_url)})"])
+    if pr_number is not None:
+        lines.extend(["", f"_PR #{pr_number} · This is a playful heuristic, not a software-quality or scientific decision procedure._"])
+    else:
+        lines.extend(["", "_This is a playful heuristic, not a software-quality or scientific decision procedure._"])
+    return "\n".join(lines) + "\n"
 
 
 def github_request(
@@ -662,6 +704,31 @@ def self_test() -> None:
         put_requests = [data for method, _url, data in requests if method == "PUT"]
         assert len(put_requests) == 1
         assert json.loads(put_requests[0].decode("utf-8"))["sha"] == head_sha
+
+        report_result = {
+            "decision": {"verdict": "approve", "confidence": 0.98, "reason": "renderer fixture"},
+            "input": {"files": ["docs/demo.md"], "added_lines": 1, "removed_lines": 0, "diff_sha256": "a" * 64},
+            "connectome": {"neuron_count": 10, "edge_count": 9},
+            "simulation": {
+                "ticks": 20, "synaptic_gain": 16.0, "fired_neurons_total": 4,
+                "readout_fired_neurons_total": 3, "readout_groups": ["VIS_ME"],
+                "synaptic_events": 8, "appetitive_channel_spikes": 4,
+                "aversive_channel_spikes": 0, "motor_output_spikes": 2,
+            },
+            "edge_ablation": {
+                "without_edges": {"readout_fired_neurons_total": 0},
+                "without_edges_decision": {"verdict": "hold"},
+                "decision_changed": True,
+            },
+        }
+        report = markdown(report_result, marker=True, pr_number=7, run_url="https://github.com/owner/repo/actions/runs/1")
+        def expect(condition, message):
+            if not condition:
+                raise RuntimeError(message)
+        expect(COMMENT_MARKER in report, "marker missing")
+        expect("## 🪰 FlyMerge verdict: `APPROVE`" in report, "verdict heading missing")
+        expect("139,255" not in report and "10` neurons" in report, "fixture values missing")
+        expect("Edge ablation" in report and "View the FlyMerge Actions run" in report, "report sections missing")
     print("self-test: PASS")
 
 
@@ -675,10 +742,12 @@ def main() -> int:
     parser.add_argument("--markdown", type=Path)
     parser.add_argument("--fail-on-reject", action="store_true")
     parser.add_argument("--merge", action="store_true", help="explicitly call GitHub's merge endpoint after an approve")
+    parser.add_argument("--comment-markdown", action="store_true", help="render a marker for a GitHub PR report comment")
     parser.add_argument("--repo", default=None)
     parser.add_argument("--pr", type=int, default=None)
     parser.add_argument("--token", default=None)
     parser.add_argument("--sha", default=None)
+    parser.add_argument("--run-url", default=None, help="Actions run URL to include in the PR report")
     parser.add_argument("--compare-no-edges", action="store_true", help="also run an explicit real-edge ablation")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -711,7 +780,6 @@ def main() -> int:
     else:
         pull_request = None
         diff_text = args.diff.read_text(encoding="utf-8") if args.diff else sys.stdin.read()
-
     result = evaluate(
         diff_text,
         args.data_dir,
@@ -729,7 +797,15 @@ def main() -> int:
         args.output.write_text(rendered, encoding="utf-8")
     if args.markdown:
         args.markdown.parent.mkdir(parents=True, exist_ok=True)
-        args.markdown.write_text(markdown(result), encoding="utf-8")
+        args.markdown.write_text(
+            markdown(
+                result,
+                marker=args.comment_markdown,
+                pr_number=args.pr if args.comment_markdown else None,
+                run_url=args.run_url if args.comment_markdown else None,
+            ),
+            encoding="utf-8",
+        )
     print(rendered, end="")
     return 2 if args.fail_on_reject and result["decision"]["verdict"] == "reject" else 0
 
