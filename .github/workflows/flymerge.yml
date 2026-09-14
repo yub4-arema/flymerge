@@ -1,0 +1,178 @@
+name: FlyMerge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number (required for manual evaluation/merge)"
+        required: true
+        type: number
+      merge:
+        description: "Call GitHub merge API only after an approve result"
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  # Resolve only GitHub API metadata before any repository code is checked out.
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      trusted_sha: ${{ steps.refs.outputs.trusted_sha }}
+      pr_number: ${{ steps.refs.outputs.pr_number }}
+      base_sha: ${{ steps.refs.outputs.base_sha }}
+      head_sha: ${{ steps.refs.outputs.head_sha }}
+    steps:
+      - name: Resolve trusted default and PR refs from GitHub API
+        id: refs
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com"
+          auth=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          test -n "$PR_NUMBER"
+          pr_json="$(curl -fsSL --retry 2 "${auth[@]}" "$api/repos/$REPO/pulls/$PR_NUMBER")"
+          trusted_sha="$(curl -fsSL --retry 2 "${auth[@]}" "$api/repos/$REPO/git/ref/heads/$DEFAULT_BRANCH" | python -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])')"
+          base_sha="$(printf '%s' "$pr_json" | python -c 'import json, sys; print(json.load(sys.stdin)["base"]["sha"])')"
+          head_sha="$(printf '%s' "$pr_json" | python -c 'import json, sys; print(json.load(sys.stdin)["head"]["sha"])')"
+          test -n "$trusted_sha"; test -n "$base_sha"; test -n "$head_sha"
+          {
+            echo "trusted_sha=$trusted_sha"
+            echo "pr_number=$PR_NUMBER"
+            echo "base_sha=$base_sha"
+            echo "head_sha=$head_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  judge:
+    needs: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      verdict: ${{ steps.result.outputs.verdict }}
+    steps:
+      # This job's only checkout is a SHA resolved from the protected default
+      # branch, never the PR head and never a PR-provided ref.
+      - name: Checkout trusted FlyMerge implementation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.trusted_sha }}
+          fetch-depth: 1
+      - name: Fetch the exact PR diff from GitHub API
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+          EXPECTED_BASE_SHA: ${{ needs.resolve.outputs.base_sha }}
+          EXPECTED_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://api.github.com"
+          pull_url="$api/repos/$REPO/pulls/$PR_NUMBER"
+          metadata="$(curl -fsSL --retry 2 \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$pull_url")"
+          base_sha="$(printf '%s' "$metadata" | python -c 'import json, sys; print(json.load(sys.stdin)["base"]["sha"])')"
+          head_sha="$(printf '%s' "$metadata" | python -c 'import json, sys; print(json.load(sys.stdin)["head"]["sha"])')"
+          EXPECTED_BASE_SHA="$EXPECTED_BASE_SHA" EXPECTED_HEAD_SHA="$EXPECTED_HEAD_SHA" BASE_SHA="$base_sha" HEAD_SHA="$head_sha" python -c 'import os; assert os.environ["BASE_SHA"] == os.environ["EXPECTED_BASE_SHA"]; assert os.environ["HEAD_SHA"] == os.environ["EXPECTED_HEAD_SHA"]'
+          curl -fsSL --retry 2 \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.diff" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$pull_url" \
+            -o "$RUNNER_TEMP/flymerge.diff"
+          metadata_after="$(curl -fsSL --retry 2 \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$pull_url")"
+          INITIAL_BASE_SHA="$base_sha" INITIAL_HEAD_SHA="$head_sha" AFTER_BASE_SHA="$(printf '%s' "$metadata_after" | python -c 'import json, sys; print(json.load(sys.stdin)["base"]["sha"])')" AFTER_HEAD_SHA="$(printf '%s' "$metadata_after" | python -c 'import json, sys; print(json.load(sys.stdin)["head"]["sha"])')" python -c 'import os; assert os.environ["AFTER_BASE_SHA"] == os.environ["INITIAL_BASE_SHA"]; assert os.environ["AFTER_HEAD_SHA"] == os.environ["INITIAL_HEAD_SHA"]'
+      - name: Run trusted FlyMerge implementation
+        id: result
+        shell: bash
+        run: |
+          set +e
+          python flymerge.py \
+            --diff "$RUNNER_TEMP/flymerge.diff" \
+            --data-dir data \
+            --ticks 20 \
+            --gain 16 \
+            --output flymerge.json \
+            --markdown flymerge.md \
+            --compare-no-edges \
+            --fail-on-reject
+          status=$?
+          if [ -f flymerge.json ]; then
+            verdict="$(python -c "import json; print(json.load(open('flymerge.json', encoding='utf-8'))['decision']['verdict'])")"
+            echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+            cat flymerge.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
+      - name: Upload FlyMerge result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flymerge-result
+          path: |
+            flymerge.json
+            flymerge.md
+
+  merge:
+    needs: [resolve, judge]
+    if: github.event_name == 'workflow_dispatch' && inputs.merge == true && needs.judge.result == 'success' && needs.judge.outputs.verdict == 'approve'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # Reuse the trusted implementation/data at the already resolved SHA.
+      - name: Checkout trusted FlyMerge implementation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.trusted_sha }}
+          fetch-depth: 1
+      - name: Re-fetch current PR and merge with an exact head SHA
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://api.github.com"
+          auth=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          pull_url="$api/repos/$REPO/pulls/$PR_NUMBER"
+          pr_json="$(curl -fsSL --retry 2 "${auth[@]}" "$pull_url")"
+          base_sha="$(printf '%s' "$pr_json" | python -c 'import json, sys; print(json.load(sys.stdin)["base"]["sha"])')"
+          head_sha="$(printf '%s' "$pr_json" | python -c 'import json, sys; print(json.load(sys.stdin)["head"]["sha"])')"
+          curl -fsSL --retry 2 \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.diff" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$pull_url" \
+            -o "$RUNNER_TEMP/flymerge.diff"
+          metadata_after="$(curl -fsSL --retry 2 "${auth[@]}" "$pull_url")"
+          INITIAL_BASE_SHA="$base_sha" INITIAL_HEAD_SHA="$head_sha" AFTER_BASE_SHA="$(printf '%s' "$metadata_after" | python -c 'import json, sys; print(json.load(sys.stdin)["base"]["sha"])')" AFTER_HEAD_SHA="$(printf '%s' "$metadata_after" | python -c 'import json, sys; print(json.load(sys.stdin)["head"]["sha"])')" python -c 'import os; assert os.environ["AFTER_BASE_SHA"] == os.environ["INITIAL_BASE_SHA"]; assert os.environ["AFTER_HEAD_SHA"] == os.environ["INITIAL_HEAD_SHA"]'
+          python flymerge.py \
+            --diff "$RUNNER_TEMP/flymerge.diff" \
+            --data-dir data \
+            --ticks 20 \
+            --gain 16 \
+            --repo "$REPO" \
+            --pr "$PR_NUMBER" \
+            --sha "$head_sha" \
+            --merge
