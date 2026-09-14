@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import html
 import json
 import math
 import os
@@ -70,6 +71,7 @@ MOTOR_OUTPUTS = {"VNC_CPG", "MN_PROBOSCIS", "MN_HEAD", "MN_ABDOMEN", "GENERIC_MO
 SYNAPTIC_GAIN = 16.0
 DEFAULT_TICKS = 20
 GITHUB_API = "https://api.github.com"
+COMMENT_MARKER = "<!-- flymerge:report:v1 -->"
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -369,24 +371,73 @@ def evaluate(
     return result
 
 
-def markdown(result: dict) -> str:
+def _safe(value: object) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def markdown(result: dict, *, marker: bool = False, pr_number: int | None = None, run_url: str | None = None) -> str:
     decision = result["decision"]
     simulation = result["simulation"]
-    return "\n".join(
-        [
-            f"# FlyMerge: `{decision['verdict']}`",
-            "",
-            f"- Confidence: `{decision['confidence']}`",
-            f"- Reason: {decision['reason']}",
-            f"- Diff: `{result['input']['diff_sha256'][:12]}` ({len(result['input']['files'])} files, +{result['input']['added_lines']}/-{result['input']['removed_lines']})",
-            f"- Connectome: `{result['connectome']['neuron_count']:,}` neurons / `{result['connectome']['edge_count']:,}` edges",
-            f"- Simulation: `{simulation['ticks']}` ticks, `{simulation['fired_neurons_total']:,}` fired neurons",
-            f"- Downstream readout: `{simulation['readout_fired_neurons_total']:,}` fired in {len(simulation['readout_groups'])} groups; approach `{simulation['appetitive_channel_spikes']}`, aversive `{simulation['aversive_channel_spikes']}`, motor `{simulation['motor_output_spikes']}`",
-            *([f"- Edge ablation: without edges readout `{result['edge_ablation']['without_edges']['readout_fired_neurons_total']:,}` / decision `{result['edge_ablation']['without_edges_decision']['verdict']}`; real-edge contribution `{result['edge_ablation']['edge_contribution']['synaptic_events']:+,}` events; decision changed `{result['edge_ablation']['decision_changed']}`"] if "edge_ablation" in result else []),
-            "",
-            "This is a joke heuristic, not a software-quality or scientific decision procedure.",
-        ]
-    ) + "\n"
+    verdict = str(decision["verdict"])
+    badge = {"approve": "✅", "reject": "🚨", "hold": "🫥"}.get(verdict, "🪰")
+    oracle = {
+        "approve": "追い風。回路は前進を選んだ。",
+        "reject": "警報。回路は危険側へ傾いた。",
+        "hold": "沈黙。回路はまだ決められない。",
+    }.get(verdict, "神託は不明。")
+    lines = [
+        *([COMMENT_MARKER, ""] if marker else []),
+        f"## 🪰 FlyMerge verdict: `{_safe(verdict.upper())}` {badge}",
+        "",
+        f"> 🔮 神託: {_safe(oracle)}",
+        "",
+        f"**Confidence** `{_safe(decision['confidence'])}` · **Diff** `{_safe(result['input']['diff_sha256'][:12])}` · **Files** `{len(result['input']['files'])}` (+{result['input']['added_lines']}/-{result['input']['removed_lines']})",
+        "",
+        "| 🧠 Connectome | ⏱ Simulation |",
+        "|---|---|",
+        f"| `{result['connectome']['neuron_count']:,}` neurons · `{result['connectome']['edge_count']:,}` edges | `{simulation['ticks']}` ticks · gain `{simulation['synaptic_gain']}` |",
+        "",
+        "### Signal channels",
+        "| Approach | Aversive | Motor |",
+        "|---:|---:|---:|",
+        f"| `{simulation['appetitive_channel_spikes']}` | `{simulation['aversive_channel_spikes']}` | `{simulation['motor_output_spikes']}` |",
+    ]
+    if "edge_ablation" in result:
+        ablation = result["edge_ablation"]
+        lines.extend(
+            [
+                "",
+                "### 🕸️ Edge ablation",
+                f"Real edges: `{simulation['readout_fired_neurons_total']:,}` readout spikes · `{simulation['synaptic_events']:,}` synaptic events · verdict `{_safe(verdict)}`",
+                f"Without edges: `{ablation['without_edges']['readout_fired_neurons_total']:,}` readout spikes · verdict `{_safe(ablation['without_edges_decision']['verdict'])}` · decision changed `{ablation['decision_changed']}`",
+            ]
+        )
+    details = [
+        "",
+        "<details>",
+        "<summary>🧬 Neural details</summary>",
+        "",
+        f"- Fired neurons: `{simulation['fired_neurons_total']:,}`; downstream readout: `{simulation['readout_fired_neurons_total']:,}` in `{len(simulation['readout_groups'])}` groups.",
+        f"- Reason: {_safe(decision['reason'])}",
+    ]
+    review = result.get("review")
+    if review:
+        review_status = review.get("status", "unknown")
+        review_line = f"- Official GitHub review: `{_safe(review_status)}`"
+        if review.get("url"):
+            review_line += f" ([details]({_safe(review['url'])}))"
+        if review.get("message"):
+            review_line += f" — {_safe(review['message'])}"
+        details.append(review_line)
+    details.extend(["", "</details>"])
+    lines.extend(details)
+    if run_url and re.fullmatch(r"https://[^/\s]+/[^/\s]+/actions/runs/\d+", run_url):
+        lines.extend(["", f"[View the FlyMerge Actions run]({_safe(run_url)})"])
+    if pr_number is not None:
+        lines.extend(["", f"_PR #{pr_number} · This is a playful heuristic, not a software-quality or scientific decision procedure._"])
+    else:
+        lines.extend(["", "_This is a playful heuristic, not a software-quality or scientific decision procedure._"])
+    return "\n".join(lines) + "\n"
 
 
 def github_request(
@@ -463,6 +514,103 @@ def fetch_pull_request(repo: str, number: int, token: str, opener=None) -> tuple
         "diff_sha256": hashlib.sha256(diff_raw).hexdigest(),
     }
     return pull_request, diff_text
+
+
+def submit_review(result: dict, repo: str, number: int, token: str, head_sha: str, opener=None) -> dict:
+    if result["decision"]["verdict"] != "approve":
+        return {"status": "not-requested"}
+    if not head_sha:
+        return {"status": "unavailable", "message": "the PR head SHA was missing"}
+    reviews_url = f"{GITHUB_API}/repos/{repo}/pulls/{number}/reviews?per_page=100"
+    try:
+        status, raw = github_request(reviews_url, token, opener=opener)
+        if status >= 300:
+            raise RuntimeError(f"GitHub review listing returned HTTP {status}")
+        reviews = json.loads(raw.decode("utf-8"))
+        existing = next(
+            (
+                item
+                for item in reviews
+                if item.get("user", {}).get("login") == "github-actions[bot]"
+                and item.get("commit_id") == head_sha
+                and item.get("state") == "APPROVED"
+            ),
+            None,
+        )
+        if existing:
+            return {"status": "already-approved", "url": existing.get("html_url")}
+        status, raw = github_request(
+            f"{GITHUB_API}/repos/{repo}/pulls/{number}/reviews",
+            token,
+            method="POST",
+            payload={
+                "commit_id": head_sha,
+                "body": "FlyMerge produced an approve verdict for the exact PR diff. See the 🪰 bot report for neural details.",
+                "event": "APPROVE",
+            },
+            opener=opener,
+        )
+        if status >= 300:
+            raise RuntimeError(f"GitHub review creation returned HTTP {status}")
+        review = json.loads(raw.decode("utf-8"))
+        if review.get("state") != "APPROVED":
+            return {"status": "unavailable", "message": f"GitHub returned review state {review.get('state', 'unknown')}"}
+        return {"status": "created", "url": review.get("html_url")}
+    except (RuntimeError, ValueError, TypeError, json.JSONDecodeError) as error:
+        return {"status": "unavailable", "message": str(error)[:240]}
+
+
+def upsert_comment(
+    result: dict,
+    repo: str,
+    number: int,
+    token: str,
+    run_url: str | None = None,
+    opener=None,
+) -> dict:
+    if not re.fullmatch(r"[^/\s]+/[^/\s]+", repo):
+        raise ValueError("--repo must be OWNER/REPO")
+    if number < 1:
+        raise ValueError("--pr must be a positive pull request number")
+    if not token:
+        raise ValueError("a GitHub token is required")
+    body = markdown(result, marker=True, pr_number=number, run_url=run_url)
+    comments_url = f"{GITHUB_API}/repos/{repo}/issues/{number}/comments?per_page=100"
+    status, raw = github_request(comments_url, token, opener=opener)
+    if status >= 300:
+        raise RuntimeError(f"GitHub comment listing returned HTTP {status}")
+    comments = json.loads(raw.decode("utf-8"))
+    existing = next(
+        (
+            item
+            for item in comments
+            if item.get("user", {}).get("login") == "github-actions[bot]"
+            and COMMENT_MARKER in item.get("body", "")
+        ),
+        None,
+    )
+    if existing and existing.get("id"):
+        status, raw = github_request(
+            f"{GITHUB_API}/repos/{repo}/issues/comments/{existing['id']}",
+            token,
+            method="PATCH",
+            payload={"body": body},
+            opener=opener,
+        )
+        operation = "updated"
+    else:
+        status, raw = github_request(
+            f"{GITHUB_API}/repos/{repo}/issues/{number}/comments",
+            token,
+            method="POST",
+            payload={"body": body},
+            opener=opener,
+        )
+        operation = "created"
+    if status >= 300:
+        raise RuntimeError(f"GitHub comment {operation} returned HTTP {status}")
+    comment = json.loads(raw.decode("utf-8"))
+    return {"status": operation, "comment_id": comment.get("id"), "url": comment.get("html_url")}
 
 
 def merge_pr(result: dict, repo: str, number: int, token: str, sha: str | None, pull_request: dict, opener=None) -> dict:
@@ -662,6 +810,65 @@ def self_test() -> None:
         put_requests = [data for method, _url, data in requests if method == "PUT"]
         assert len(put_requests) == 1
         assert json.loads(put_requests[0].decode("utf-8"))["sha"] == head_sha
+
+        report_result = {
+            "decision": {"verdict": "approve", "confidence": 0.98, "reason": "test result"},
+            "input": {"files": ["docs/demo.md"], "added_lines": 1, "removed_lines": 0, "diff_sha256": "a" * 64},
+            "connectome": {"neuron_count": 10, "edge_count": 9},
+            "simulation": {
+                "ticks": 20,
+                "synaptic_gain": 16.0,
+                "fired_neurons_total": 4,
+                "readout_fired_neurons_total": 3,
+                "readout_groups": ["VIS_ME"],
+                "synaptic_events": 8,
+                "appetitive_channel_spikes": 4,
+                "aversive_channel_spikes": 0,
+                "motor_output_spikes": 2,
+            },
+            "edge_ablation": {
+                "without_edges": {"readout_fired_neurons_total": 0},
+                "without_edges_decision": {"verdict": "hold"},
+                "decision_changed": True,
+            },
+        }
+        comment_state = {"body": None, "posts": 0, "patches": 0}
+
+        def comment_opener(request, timeout=30):
+            del timeout
+            if request.method == "GET" and "/issues/7/comments" in request.full_url:
+                comments = [] if comment_state["body"] is None else [{
+                    "id": 42,
+                    "body": comment_state["body"],
+                    "user": {"login": "github-actions[bot]"},
+                }]
+                return MockResponse(200, json.dumps(comments).encode("utf-8"))
+            if request.method == "POST" and request.full_url.endswith("/issues/7/comments"):
+                comment_state["posts"] += 1
+                comment_state["body"] = json.loads(request.data.decode("utf-8"))["body"]
+                return MockResponse(201, json.dumps({"id": 42, "html_url": "https://github.com/owner/repo/issues/7#issuecomment-42"}).encode("utf-8"))
+            if request.method == "PATCH" and request.full_url.endswith("/issues/comments/42"):
+                comment_state["patches"] += 1
+                comment_state["body"] = json.loads(request.data.decode("utf-8"))["body"]
+                return MockResponse(200, json.dumps({"id": 42, "html_url": "https://github.com/owner/repo/issues/7#issuecomment-42"}).encode("utf-8"))
+            raise AssertionError(f"unexpected comment URL: {request.full_url}")
+
+        created_comment = upsert_comment(report_result, "owner/repo", 7, "token", "https://github.com/owner/repo/actions/runs/1", opener=comment_opener)
+        assert created_comment["status"] == "created" and COMMENT_MARKER in comment_state["body"]
+        assert "## 🪰 FlyMerge verdict: `APPROVE`" in comment_state["body"]
+        updated_comment = upsert_comment(report_result, "owner/repo", 7, "token", "https://github.com/owner/repo/actions/runs/2", opener=comment_opener)
+        assert updated_comment["status"] == "updated" and comment_state["posts"] == 1 and comment_state["patches"] == 1
+
+        def denied_review_opener(request, timeout=30):
+            del timeout
+            if request.method == "GET" and request.full_url.endswith("/pulls/7/reviews?per_page=100"):
+                return MockResponse(200, b"[]")
+            if request.method == "POST" and request.full_url.endswith("/pulls/7/reviews"):
+                return MockResponse(403, b'{"message":"approval disabled"}')
+            raise AssertionError(f"unexpected review URL: {request.full_url}")
+
+        denied_review = submit_review(report_result, "owner/repo", 7, "token", head_sha, opener=denied_review_opener)
+        assert denied_review["status"] == "unavailable"
     print("self-test: PASS")
 
 
@@ -675,10 +882,13 @@ def main() -> int:
     parser.add_argument("--markdown", type=Path)
     parser.add_argument("--fail-on-reject", action="store_true")
     parser.add_argument("--merge", action="store_true", help="explicitly call GitHub's merge endpoint after an approve")
+    parser.add_argument("--comment", action="store_true", help="upsert the FlyMerge report on the GitHub PR")
+    parser.add_argument("--review", action="store_true", help="try an official GitHub APPROVE review for an approve verdict")
     parser.add_argument("--repo", default=None)
     parser.add_argument("--pr", type=int, default=None)
     parser.add_argument("--token", default=None)
     parser.add_argument("--sha", default=None)
+    parser.add_argument("--run-url", default=None, help="Actions run URL to include in the PR report")
     parser.add_argument("--compare-no-edges", action="store_true", help="also run an explicit real-edge ablation")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -690,16 +900,17 @@ def main() -> int:
     if not math.isfinite(args.gain) or args.gain <= 0:
         parser.error("--gain must be finite and positive")
 
-    if args.merge:
+    needs_remote = args.merge or args.comment or args.review
+    if needs_remote:
         if not args.diff:
-            parser.error("--merge requires --diff so the evaluated input is explicit")
-        if not args.sha:
+            parser.error("--merge, --comment, and --review require --diff so the evaluated input is explicit")
+        if args.merge and not args.sha:
             parser.error("--merge requires --sha with the PR head SHA")
         repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
-        token = args.token or os.environ.get("GITHUB_TOKEN")
+        token = os.environ.get("GITHUB_TOKEN") if (args.comment or args.review) else (args.token or os.environ.get("GITHUB_TOKEN"))
         number = args.pr
         if not repo or not token or not number:
-            parser.error("--merge requires --repo, --pr, and --token (or GITHUB_* environment variables)")
+            parser.error("GitHub operations require --repo, --pr, and GITHUB_TOKEN")
         pull_request, api_diff = fetch_pull_request(repo, number, token)
         diff_bytes = args.diff.read_bytes()
         try:
@@ -707,7 +918,7 @@ def main() -> int:
         except UnicodeDecodeError as error:
             raise RuntimeError("refusing merge because --diff is not valid UTF-8") from error
         if diff_bytes != api_diff.encode("utf-8"):
-            raise RuntimeError("refusing merge because --diff does not exactly match the current PR diff from GitHub")
+            raise RuntimeError("refusing GitHub operation because --diff does not exactly match the current PR diff from GitHub")
     else:
         pull_request = None
         diff_text = args.diff.read_text(encoding="utf-8") if args.diff else sys.stdin.read()
@@ -719,6 +930,10 @@ def main() -> int:
         compare_no_edges=args.compare_no_edges,
         synaptic_gain=args.gain,
     )
+    if args.review:
+        result["review"] = submit_review(result, repo, number, token, pull_request["head_sha"])
+    if args.comment:
+        result["comment"] = upsert_comment(result, repo, number, token, run_url=args.run_url)
     if args.merge:
         result["pull_request"] = pull_request
         result["merge"] = merge_pr(result, repo, number, token, args.sha, pull_request)

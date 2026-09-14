@@ -15,6 +15,10 @@ on:
         default: false
         type: boolean
 
+concurrency:
+  group: flymerge-pr-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
 jobs:
   # Resolve only GitHub API metadata before any repository code is checked out.
   resolve:
@@ -58,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
     outputs:
       verdict: ${{ steps.result.outputs.verdict }}
     steps:
@@ -103,6 +107,11 @@ jobs:
           INITIAL_BASE_SHA="$base_sha" INITIAL_HEAD_SHA="$head_sha" AFTER_BASE_SHA="$(printf '%s' "$metadata_after" | python -c 'import json, sys; print(json.load(sys.stdin)["base"]["sha"])')" AFTER_HEAD_SHA="$(printf '%s' "$metadata_after" | python -c 'import json, sys; print(json.load(sys.stdin)["head"]["sha"])')" python -c 'import os; assert os.environ["AFTER_BASE_SHA"] == os.environ["INITIAL_BASE_SHA"]; assert os.environ["AFTER_HEAD_SHA"] == os.environ["INITIAL_HEAD_SHA"]'
       - name: Run trusted FlyMerge implementation
         id: result
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |
           set +e
@@ -114,6 +123,11 @@ jobs:
             --output flymerge.json \
             --markdown flymerge.md \
             --compare-no-edges \
+            --repo "$REPO" \
+            --pr "$PR_NUMBER" \
+            --run-url "$RUN_URL" \
+            --comment \
+            --review \
             --fail-on-reject
           status=$?
           if [ -f flymerge.json ]; then
