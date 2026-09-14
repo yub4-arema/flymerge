@@ -74,12 +74,14 @@ jobs:
           ref: ${{ needs.resolve.outputs.trusted_sha }}
           fetch-depth: 1
       - name: Fetch the exact PR diff from GitHub API
+        id: result
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
           EXPECTED_BASE_SHA: ${{ needs.resolve.outputs.base_sha }}
           EXPECTED_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |
           set -euo pipefail
@@ -105,15 +107,6 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "$pull_url")"
           INITIAL_BASE_SHA="$base_sha" INITIAL_HEAD_SHA="$head_sha" AFTER_BASE_SHA="$(printf '%s' "$metadata_after" | python -c 'import json, sys; print(json.load(sys.stdin)["base"]["sha"])')" AFTER_HEAD_SHA="$(printf '%s' "$metadata_after" | python -c 'import json, sys; print(json.load(sys.stdin)["head"]["sha"])')" python -c 'import os; assert os.environ["AFTER_BASE_SHA"] == os.environ["INITIAL_BASE_SHA"]; assert os.environ["AFTER_HEAD_SHA"] == os.environ["INITIAL_HEAD_SHA"]'
-      - name: Run trusted FlyMerge implementation
-        id: result
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        shell: bash
-        run: |
           set +e
           python flymerge.py \
             --diff "$RUNNER_TEMP/flymerge.diff" \
@@ -122,18 +115,44 @@ jobs:
             --gain 16 \
             --output flymerge.json \
             --markdown flymerge.md \
-            --compare-no-edges \
-            --repo "$REPO" \
+            --comment-markdown \
             --pr "$PR_NUMBER" \
             --run-url "$RUN_URL" \
-            --comment \
-            --review \
+            --compare-no-edges \
             --fail-on-reject
           status=$?
+          set -e
           if [ -f flymerge.json ]; then
             verdict="$(python -c "import json; print(json.load(open('flymerge.json', encoding='utf-8'))['decision']['verdict'])")"
             echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
             cat flymerge.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          body="$(cat flymerge.md)"
+          comment_id="$(gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- flymerge:report:v1 -->"))) | .id' | head -n 1)"
+          if [ -n "$comment_id" ]; then
+            comment_status="updated"
+            comment_json="$(gh api --method PATCH "repos/$REPO/issues/comments/$comment_id" --field body="$body")"
+          else
+            comment_status="created"
+            comment_json="$(gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --field body="$body")"
+          fi
+          comment_url="$(printf '%s' "$comment_json" | python -c 'import json, sys; print(json.load(sys.stdin).get("html_url", ""))')"
+          echo "comment_status=$comment_status" >> "$GITHUB_OUTPUT"
+          echo "comment_url=$comment_url" >> "$GITHUB_OUTPUT"
+          echo "FlyMerge report comment $comment_status: $comment_url"
+          if [ "$verdict" = "approve" ]; then
+            set +e
+            gh api --method POST "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+              --field commit_id="$EXPECTED_HEAD_SHA" \
+              --field body='FlyMerge produced an approve verdict for the exact PR diff. See the 🪰 bot report for neural details.' \
+              --field event=APPROVE >/dev/null
+            review_status=$?
+            set -e
+            if [ "$review_status" -eq 0 ]; then
+              echo "Official GitHub review APPROVE: created or accepted"
+            else
+              echo "Official GitHub review APPROVE: unavailable; FlyMerge report comment and judge check remain the source of truth"
+            fi
           fi
           exit $status
       - name: Upload FlyMerge result

@@ -50,7 +50,7 @@ Actionsを手動実行する場合は、対象PR番号を入力し、judge結果
 
 judgeは `<!-- flymerge:report:v1 -->` marker付きの単一issue commentを `GET` → bot commentの `PATCH`、なければ `POST` でupsertします。コメントは🪰 verdict、神託、neuron/edge/tick、approach/aversive/motor、edge ablation、Actions runの詳細を表示し、PR本文やPR差分の自由文は埋め込みません。PRごとのActions concurrencyも設定して、synchronizeでコメントが増殖しにくいようにしています。
 
-approve verdictでは公式のGitHub review `APPROVE` も試みます。これは `pull-requests: write` とrepositoryの「Allow GitHub Actions to create and approve pull requests」設定が必要です。設定で拒否された場合にapprove reviewを偽装せず、commentとjudge checkだけを正確なFlyMerge verdictとして残します。根拠: [issue comment REST API](https://docs.github.com/en/rest/issues/comments)、[pull request review REST API](https://docs.github.com/en/rest/pulls/reviews)、[GITHUB_TOKEN workflow permissions](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication)、[pull_request_targetの安全利用](https://docs.github.com/en/actions/reference/security/secure-use)。
+approve verdictでは公式のGitHub review `APPROVE` も試みます。Actions settingsでreviewの自動submitが無効なら、reviewを捏造せず、commentとjudge checkだけを正確なFlyMerge verdictとして残します。仕様の根拠はGitHub公式のREST APIとActions security documentationです。
 
 ## 判定とモデル
 
